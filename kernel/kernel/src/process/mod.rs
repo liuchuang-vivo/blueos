@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(enable_vfs)]
+use crate::vfs::fd_manager::FdManager;
 use crate::{
     error::Error,
     scheduler,
@@ -150,6 +152,9 @@ pub struct Process {
     parent: Weak<Process>,
     // The threads owned by this process.
     threads: SpinLock<ThreadList>,
+    // This process's open-file table.
+    #[cfg(enable_vfs)]
+    fd_manager: SpinLock<FdManager>,
 }
 
 // SAFETY: `Process` would otherwise be `!Send` only because `threads` holds a
@@ -173,10 +178,17 @@ impl Process {
             pid,
             parent,
             threads: SpinLock::new(ThreadList::new()),
+
+            #[cfg(enable_vfs)]
+            fd_manager: SpinLock::new(FdManager::new()),
         });
         // SAFETY: `arc` is the sole strong ref and is not yet observable by any
         // other thread, so this `&mut Process` aliases no live reference.
         let p = unsafe { Arc::as_ptr(&arc).cast_mut().as_mut().unwrap() };
+        #[cfg(enable_vfs)]
+        {
+            p.fd_manager.irqsave_lock().init_stdio()?;
+        }
         p.threads.irqsave_lock().init();
         Ok(arc)
     }
@@ -192,6 +204,12 @@ impl Process {
     pub fn set_parent(&mut self, parent: Weak<Process>) -> Result<(), Error> {
         self.parent = parent;
         Ok(())
+    }
+
+    /// This process's open-file table. Only present when VFS is enabled.
+    #[cfg(enable_vfs)]
+    pub fn fd_manager(&self) -> &SpinLock<FdManager> {
+        &self.fd_manager
     }
 
     /// Add a thread to this process's thread list.
@@ -247,10 +265,11 @@ impl Process {
 impl core::fmt::Debug for Process {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let parent_pid = self.parent.upgrade().map(|p| p.pid());
-        f.debug_struct("Process")
-            .field("pid", &self.pid)
-            .field("parent", &parent_pid)
-            .finish()
+        let mut dbg = f.debug_struct("Process");
+        dbg.field("pid", &self.pid).field("parent", &parent_pid);
+        #[cfg(enable_vfs)]
+        dbg.field("fd_manager", &"<per-process>");
+        dbg.finish()
     }
 }
 
@@ -275,6 +294,25 @@ mod tests {
         let child = Process::new(Pid(2), Arc::downgrade(&root)).expect("Process::new failed");
         assert_ne!(child.pid(), root.pid());
         assert_eq!(child.parent().map(|p| p.pid()), Some(ROOT_PID));
+
+        // When VFS is enabled, every process also owns an independent
+        // per-process open-file table. The syscall path resolves each
+        // process's own table via `current_process()`.
+        #[cfg(enable_vfs)]
+        {
+            // `Process::new` initializes stdio (stdin/stdout/stderr) for every
+            // process, so both root and child have 3 fds and `get_file_ops(0)`
+            // is `Some`.
+            assert_eq!(root.fd_manager().irqsave_lock().count(), 3);
+            assert!(root.fd_manager().irqsave_lock().get_file_ops(0).is_some());
+            assert_eq!(child.fd_manager().irqsave_lock().count(), 3);
+            assert!(child.fd_manager().irqsave_lock().get_file_ops(0).is_some());
+            // Root and child do not share a fd table.
+            assert!(!core::ptr::eq(
+                root.fd_manager() as *const _,
+                child.fd_manager() as *const _,
+            ));
+        }
     }
 
     #[test]

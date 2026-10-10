@@ -22,6 +22,7 @@ extern crate alloc;
 use alloc::alloc::{alloc as system_alloc, dealloc as system_dealloc};
 use blueos::{
     arch::arm::{self, Context, NR_DEBUG_SYSCALL},
+    process::current_process,
     scheduler,
     scheduler::InsertToEnd,
     sync::semaphore::Semaphore,

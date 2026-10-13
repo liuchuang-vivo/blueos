@@ -77,6 +77,9 @@ pub extern "C" fn tm_thread_create(
         entry as *mut core::ffi::c_void,
     ));
     let t = builder.set_priority(priority as ThreadPriority).build();
+    if let Some(proc) = current_process() {
+        proc.add_thread(t.clone());
+    }
     unsafe {
         TM_THREADS[thread_id as usize].write(t);
     }

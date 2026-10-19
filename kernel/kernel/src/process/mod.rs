@@ -105,12 +105,29 @@ impl ProcessManager {
 
     pub fn create_process(&self, parent: Weak<Process>) -> Result<Arc<Process>, Error> {
         let pid = self.alloc_pid();
-        let process = Process::new(pid, parent)?;
-        Ok(self.table.insert(process))
+        let process = Process::new(pid, parent.clone())?;
+        let inserted = self.table.insert(process);
+        if let Some(parent_arc) = parent.upgrade() {
+            parent_arc.add_child(inserted.pid(), Arc::downgrade(&inserted));
+        }
+        Ok(inserted)
     }
 
     pub fn destroy_process(&self, pid: Pid) -> Option<Arc<Process>> {
-        self.table.remove(pid)
+        let removed = self.table.remove(pid);
+        if let Some(ref proc) = removed {
+            // Unregister from the parent's children map. `proc.parent()`
+            // takes the child's topology read lock and releases it before we
+            // take the parent's topology write lock — no nested locks.
+            if let Some(parent) = proc.parent() {
+                parent.remove_child(proc.pid());
+            }
+            // (Future: reparent this process's children to the reaper/init
+            // here, iterating `proc`'s children under its topology read lock
+            // and reassigning each child's parent + moving the children
+            // entry.)
+        }
+        removed
     }
 
     pub fn alloc_pid(&self) -> Pid {
@@ -146,10 +163,20 @@ impl ProcessManager {
 
 static PROCESS_MANAGER: Once<ProcessManager> = Once::new();
 
+/// Parent/child topology of a process.
+struct ProcessTopology {
+    // Weak back-pointer to the parent process.
+    parent: Weak<Process>,
+    // Children of this process: Pid -> Weak<Process>.
+    children: BTreeMap<Pid, Weak<Process>>,
+}
+
 pub struct Process {
     pid: Pid,
-    // A weak reference to the parent process.
-    parent: Weak<Process>,
+    // Parent/child topology. Read with `irqsave_read()`, mutate with
+    // `irqsave_write()`. Never hold two processes' topology locks at once
+    // (see `ProcessManager::create_process`/`destroy_process`).
+    topology: SpinLock<ProcessTopology>,
     // The threads owned by this process.
     threads: SpinLock<ThreadList>,
     // This process's open-file table.
@@ -162,9 +189,9 @@ pub struct Process {
 // a raw `NonNull`). A process never actually migrates across cores by being
 // *moved* as a Rust value: once created it is pinned behind an `Arc` whose
 // storage is never moved or dropped, and every field that can be touched
-// concurrently (`threads`, `address_space`, `fd_manager`) is already guarded
-// by a `SpinLock` whose `irqsave_lock` serializes access. The remaining fields
-// (`pid`, `parent`) are plain `Send + Sync`. So it is sound to move the owning
+// concurrently (`topology`, `threads`, `fd_manager`) is already guarded by a
+// `SpinLock` whose irqsave read/write guards serialize access. The remaining
+// field (`pid`) is plain `Send + Sync`. So it is sound to move the owning
 // `Arc<Process>` between threads and to share `&Process` across cores — which
 // the scheduler already relies on for the root process. This unlocks
 // `Once<Arc<Process>>` (the `root` field) and `Once<ProcessManager>` as
@@ -176,7 +203,10 @@ impl Process {
     pub fn new(pid: Pid, parent: Weak<Process>) -> Result<Arc<Self>, crate::error::Error> {
         let arc = Arc::new(Self {
             pid,
-            parent,
+            topology: SpinLock::new(ProcessTopology {
+                parent,
+                children: BTreeMap::new(),
+            }),
             threads: SpinLock::new(ThreadList::new()),
 
             #[cfg(enable_vfs)]
@@ -198,12 +228,54 @@ impl Process {
     }
 
     pub fn parent(&self) -> Option<Arc<Process>> {
-        self.parent.upgrade()
+        self.topology.irqsave_read().parent.upgrade()
     }
 
-    pub fn set_parent(&mut self, parent: Weak<Process>) -> Result<(), Error> {
-        self.parent = parent;
-        Ok(())
+    /// Set this process's parent pointer. Intended for future reparenting
+    /// (e.g. orphan adoption); currently has no production caller.
+    pub fn set_parent(&self, parent: Weak<Process>) {
+        self.topology.irqsave_write().parent = parent;
+    }
+
+    /// Look up a child of this process by pid.
+    pub fn child(&self, pid: Pid) -> Option<Arc<Process>> {
+        let topo = self.topology.irqsave_read();
+        topo.children.get(&pid).and_then(|w| w.upgrade())
+    }
+
+    /// Number of child processes.
+    pub fn child_count(&self) -> usize {
+        self.topology.irqsave_read().children.len()
+    }
+
+    pub fn has_no_children(&self) -> bool {
+        self.topology.irqsave_read().children.is_empty()
+    }
+
+    /// Invoke `f` for each child process (as `Arc<Process>`).
+    ///
+    /// The topology read lock is held for the duration of the call, so `f`
+    /// must not recursively take this process's topology write lock.
+    pub fn for_each_child<F: FnMut(&Arc<Process>)>(&self, mut f: F) {
+        let topo = self.topology.irqsave_read();
+        for weak in topo.children.values() {
+            if let Some(arc) = weak.upgrade() {
+                f(&arc);
+            }
+        }
+    }
+
+    /// Register a child under this process's children map.
+    fn add_child(&self, child_pid: Pid, child: Weak<Process>) {
+        self.topology
+            .irqsave_write()
+            .children
+            .insert(child_pid, child);
+    }
+
+    /// Remove a child entry. Returns the removed weak ref, if any.
+    fn remove_child(&self, child_pid: Pid) -> Option<Weak<Process>> {
+        self.topology.irqsave_write().children.remove(&child_pid)
     }
 
     /// This process's open-file table. Only present when VFS is enabled.
@@ -264,7 +336,7 @@ impl Process {
 
 impl core::fmt::Debug for Process {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let parent_pid = self.parent.upgrade().map(|p| p.pid());
+        let parent_pid = self.parent().map(|p| p.pid());
         let mut dbg = f.debug_struct("Process");
         dbg.field("pid", &self.pid).field("parent", &parent_pid);
         #[cfg(enable_vfs)]
@@ -278,6 +350,11 @@ mod tests {
     use super::*;
     use alloc::sync::Arc;
     use blueos_test_macro::test;
+    // `#[test(thread = N)]` expands to `blueos::thread::spawn`,
+    // `blueos::sync::{ConstBarrier, wait_until, wake}` and `blueos::types::Arc`.
+    // Inside the kernel crate those resolve to `crate::...`, so alias the
+    // crate to `blueos` (mirroring the convention in `lib.rs`'s test module).
+    use crate as blueos;
 
     #[test]
     fn process_basic() {
@@ -421,5 +498,180 @@ mod tests {
 
         // Sanity: root is unaffected by being a weak parent here.
         assert_eq!(child.parent().map(|p| p.pid()), Some(ROOT_PID));
+    }
+
+    #[test]
+    fn process_children_registered_on_create() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+        assert!(root.has_no_children());
+        assert_eq!(root.child_count(), 0);
+
+        let child = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let child_pid = child.pid();
+
+        // The child is now visible under root's children map.
+        assert_eq!(root.child_count(), 1);
+        assert!(Arc::ptr_eq(
+            &root.child(child_pid).expect("child lookup failed"),
+            &child,
+        ));
+        // Unknown pid returns None.
+        assert!(root.child(Pid(u32::MAX)).is_none());
+
+        // Clean up so the global root is not polluted for later tests that
+        // assert `root.has_no_children()` at entry.
+        mgr.destroy_process(child_pid);
+        assert!(root.has_no_children());
+    }
+
+    #[test]
+    fn process_children_removed_on_destroy() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+
+        let child = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let child_pid = child.pid();
+        assert_eq!(root.child_count(), 1);
+
+        mgr.destroy_process(child_pid);
+        assert!(root.child(child_pid).is_none());
+        assert_eq!(root.child_count(), 0);
+        assert!(root.has_no_children());
+    }
+
+    #[test]
+    fn process_root_has_no_parent() {
+        let root = ProcessManager::get().root_process().clone();
+        assert!(root.parent().is_none());
+    }
+
+    #[test]
+    fn process_child_parent_roundtrip() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+        let child = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let parent = child.parent().expect("child has no parent");
+        assert!(Arc::ptr_eq(&parent, &root));
+        // Clean up so the global root is not polluted for later tests.
+        mgr.destroy_process(child.pid());
+        assert!(root.has_no_children());
+    }
+
+    #[test]
+    fn process_for_each_child() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+
+        let c1 = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let c2 = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+
+        let mut visited: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+        root.for_each_child(|c| visited.push(c.pid()));
+        visited.sort();
+
+        let mut expected = alloc::vec![c1.pid(), c2.pid()];
+        expected.sort();
+        assert_eq!(visited, expected);
+
+        // Clean up so the global root is not polluted for later tests that
+        // assert `root.has_no_children()` at entry.
+        mgr.destroy_process(c1.pid());
+        mgr.destroy_process(c2.pid());
+        assert!(root.has_no_children());
+    }
+
+    // Multi-threaded concurrency on root's parent/child topology
+    #[test(thread = 3, repeat = 2)]
+    fn process_concurrent_topology_mutation() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        // Role allocator: 0 = adder, 1 = remover, 2 = reader.
+        static ROLE: AtomicUsize = AtomicUsize::new(0);
+        const ROLE_ADDER: usize = 0;
+        const ROLE_REMOVER: usize = 1;
+        const ROLE_READER: usize = 2;
+        const ITERS: usize = 20;
+
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+        let role = ROLE.fetch_add(1, Ordering::Relaxed) % 3;
+
+        match role {
+            ROLE_ADDER => {
+                // Create child processes under root
+                let mut created: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+                for _ in 0..ITERS {
+                    let child = mgr
+                        .create_process(Arc::downgrade(&root))
+                        .expect("create_process failed in adder");
+                    created.push(child.pid());
+                    crate::scheduler::yield_me();
+                }
+                // Cleanup: remove every pid we created
+                for pid in created {
+                    let _ = mgr.destroy_process(pid);
+                }
+            }
+            ROLE_REMOVER => {
+                // Destroy child processes that the adder created
+                for _ in 0..ITERS {
+                    // Collect at most one target pid under the read lock.
+                    let target: Option<Pid> = {
+                        let mut found: Option<Pid> = None;
+                        root.for_each_child(|c| {
+                            if found.is_none() {
+                                found = Some(c.pid());
+                            }
+                        });
+                        found
+                    };
+                    if let Some(pid) = target {
+                        let _ = mgr.destroy_process(pid);
+                    }
+                    crate::scheduler::yield_me();
+                }
+            }
+            _ => {
+                // Reader: iterate `for_each_child` while adder/remover mutate
+                // the same root's children map.
+                let mut read_iters = 0usize;
+                for _ in 0..ITERS {
+                    let mut seen: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+                    root.for_each_child(|c| {
+                        let parent = c.parent();
+                        assert!(
+                            parent.is_some(),
+                            "for_each_child observed a child with no parent"
+                        );
+                        assert!(
+                            Arc::ptr_eq(parent.as_ref().unwrap(), &root),
+                            "for_each_child observed a child whose parent is not root"
+                        );
+                        seen.push(c.pid());
+                    });
+                    let mut sorted = seen.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    assert_eq!(
+                        seen.len(),
+                        sorted.len(),
+                        "for_each_child observed duplicate pids in one snapshot"
+                    );
+                    read_iters += 1;
+                    crate::scheduler::yield_me();
+                }
+                assert!(read_iters > 0, "reader never iterated for_each_child");
+            }
+        }
     }
 }

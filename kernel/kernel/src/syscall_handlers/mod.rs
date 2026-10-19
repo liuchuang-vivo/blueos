@@ -405,7 +405,9 @@ create_thread(spawn_args_ptr: *const SpawnArgs) -> c_long {
     match crate::process::current_process() {
         Some(proc) => {
             if !proc.add_thread(t.clone()) {
-                log::warn!("new thread already linked to a process");
+                log::warn!(
+                    "create_thread: new thread not linked to process"
+                );
             }
         }
         None => {

@@ -139,9 +139,7 @@ impl ProcessManager {
 
     pub(crate) fn finalize_destroy(&self, proc: &Arc<Process>) -> Option<Arc<Process>> {
         let removed = self.table.remove(proc.pid());
-        let Some(ref p) = removed else {
-            return None;
-        };
+        let p = removed.as_ref()?;
         if let Some(parent) = p.parent() {
             parent.remove_child(p.pid());
         }
@@ -428,6 +426,17 @@ mod tests {
     use crate as blueos;
     use alloc::{boxed::Box, sync::Arc};
     use blueos_test_macro::test;
+
+    // Entry point for threads that the tests build via `Builder` but never
+    // schedule. `Builder::build` stores the entry in the thread's context
+    // (return-address + arg slots) but does *not* put it in `cleanup`, so it is
+    // only ever invoked if the thread is actually run — which these threads
+    // never are. Using `Entry::C` (a plain function pointer, no allocation)
+    // instead of `Entry::Closure` avoids leaking a `Box::into_raw`'d closure
+    // when such a thread is dropped un-run.
+    extern "C" fn never_run_entry() {
+        unreachable!("test-only thread must never be scheduled");
+    }
 
     #[test]
     fn process_basic() {
@@ -862,19 +871,6 @@ mod tests {
         assert!(root.has_no_children());
     }
 
-    // Regression test for the SMP race where `destroy_process` and the last
-    // thread's retire path overlapped. The original "observe
-    // `has_no_threads()` then commit `become_zombie()`" ordering leaked a
-    // permanent `Zombie` when the retire path saw `is_zombie()==false` in the
-    // observe→commit window and skipped `finalize_destroy`. The fix commits
-    // `become_zombie()` before observing the thread count.
-    //
-    // Unlike `process_state_zombie_then_dead_on_last_thread`, this variant
-    // does **not** barrier-gate the worker's retire behind the destroy call:
-    // the worker is free to retire the instant it is scheduled, racing the
-    // main thread's `destroy_process`. Over enough iterations both orderings
-    // (destroy-first and retire-first) are exercised; the bounded-spin assert
-    // turns a leak back into a loud failure.
     #[test]
     fn process_state_destroy_races_last_thread_retire() {
         const ITERS: usize = 64;
@@ -924,6 +920,228 @@ mod tests {
             }
             assert!(mgr.process_table().get(child_pid).is_none());
             assert!(root.child(child_pid).is_none());
+        }
+        assert!(root.has_no_children());
+    }
+
+    #[test]
+    fn process_root_is_immortal() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+        assert_eq!(root.pid(), ROOT_PID);
+        assert_eq!(root.state(), ProcessState::Alive);
+
+        // A direct destroy request on root is a no-op: state stays Alive, root
+        // stays in the table, root_process() keeps resolving to the same Arc.
+        assert!(mgr.destroy_process(ROOT_PID).is_none());
+        assert_eq!(root.state(), ProcessState::Alive);
+        assert!(mgr.process_table().get(ROOT_PID).is_some());
+        assert!(Arc::ptr_eq(mgr.root_process(), &root));
+
+        // A duplicate/racing destroy is still a no-op.
+        assert!(mgr.destroy_process(ROOT_PID).is_none());
+        assert_eq!(root.state(), ProcessState::Alive);
+        assert!(Arc::ptr_eq(mgr.root_process(), &root));
+
+        // The proof of immortality: root is still fully functional after the
+        // (would-be) destroy. A child created under root resolves and reaps
+        // cleanly, leaving root's topology pristine. If the guard had regressed
+        // (root became Zombie/Dead), `create_process` under root would either
+        // fail or leave the child's parent `Weak` dangling.
+        let after = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process after root-destroy failed");
+        assert_eq!(after.state(), ProcessState::Alive);
+        assert_eq!(after.parent().map(|p| p.pid()), Some(ROOT_PID));
+        // Threadless child: destroy finalizes straight through to Dead.
+        assert!(mgr.destroy_process(after.pid()).is_some());
+        assert_eq!(after.state(), ProcessState::Dead);
+        assert!(mgr.process_table().get(after.pid()).is_none());
+        assert!(root.child(after.pid()).is_none());
+        assert!(root.has_no_children());
+    }
+
+    #[test]
+    fn process_destroy_absent_and_dead_returns_none() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+        assert!(root.has_no_children());
+
+        // A pid that was never allocated. Pick one well clear of the live range
+        // (the global counter is shared across tests, so assert absence rather
+        // than a fixed value). `Pid(u32::MAX)` is reserved/never handed out by
+        // `alloc_pid` (it short-circuits to `None` long before this).
+        let absent = Pid(u32::MAX - 1);
+        assert!(mgr.process_table().get(absent).is_none());
+        assert!(mgr.destroy_process(absent).is_none());
+        // No side effects: table and root topology unchanged.
+        assert!(mgr.process_table().get(absent).is_none());
+        assert!(root.has_no_children());
+
+        // A process that is already `Dead`. Build one by destroying a
+        // threadless child (Alive + no threads => `destroy_process` finalizes
+        // straight through to Dead).
+        let child = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let child_pid = child.pid();
+        assert_eq!(child.state(), ProcessState::Alive);
+        assert!(child.has_no_threads());
+
+        assert!(mgr.destroy_process(child_pid).is_some());
+        assert_eq!(child.state(), ProcessState::Dead);
+        assert!(mgr.process_table().get(child_pid).is_none());
+        assert!(root.child(child_pid).is_none());
+
+        // Now Dead: a second destroy is a no-op returning None. The process is
+        // no longer in the table (so `table.get` already returns None), but if
+        // it were still present this would still hit the `Dead => None` arm.
+        assert!(mgr.destroy_process(child_pid).is_none());
+        assert!(root.has_no_children());
+    }
+
+    #[test]
+    fn process_add_thread_rejects_non_alive() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+        assert!(root.has_no_children());
+
+        // --- Zombie case -------------------------------------------------
+        // To reach `Zombie` (not Dead) we need a surviving thread: destroy a
+        // process that still owns a barrier-gated worker. The `Alive` arm of
+        // `destroy_process` commits `Zombie` and, seeing threads remain,
+        // returns `None` without finalizing.
+        let zombie_child = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let zombie_pid = zombie_child.pid();
+
+        let release = Arc::new(crate::sync::ConstBarrier::<{ 2 }>::new());
+        let release_w = release.clone();
+        let keeper = crate::thread::spawn(move || {
+            release_w.wait();
+            crate::scheduler::retire_me();
+        })
+        .expect("spawn keeper failed");
+        assert!(zombie_child.add_thread(keeper));
+        assert!(mgr.destroy_process(zombie_pid).is_none());
+        assert_eq!(zombie_child.state(), ProcessState::Zombie);
+
+        // A thread built but not yet linked. `add_thread` to a `Zombie`
+        // process must return `false` and must leave the thread's `process`
+        // `Weak` empty (never set by `set_process`).
+        let mut reject =
+            crate::thread::Builder::new(crate::thread::Entry::C(never_run_entry)).build();
+        assert!(!zombie_child.add_thread(reject.clone()));
+        assert!(reject.process().is_none());
+
+        // Detach the rejected thread from the global queue so it doesn't leak;
+        // the Arc then drops to zero and the Thread is reclaimed. `Drop for
+        // Thread` debug-asserts both `sched_node` and `process_node` are
+        // detached — satisfied here (sched via this remove, process_node was
+        // never linked since `add_thread` returned false).
+        assert!(crate::thread::GlobalQueueVisitor::remove(&mut reject));
+
+        // Release the keeper so the Zombie child finalizes and reaps.
+        release.wait();
+        let mut spins = 0u32;
+        while root.child(zombie_pid).is_some() {
+            crate::scheduler::yield_me();
+            spins += 1;
+            assert!(spins < 100_000, "zombie child never reaped");
+        }
+        assert_eq!(zombie_child.state(), ProcessState::Dead);
+
+        // --- Dead case ---------------------------------------------------
+        // A Dead process is even lower-leverage: `add_thread` must reject it
+        // too. Build a Dead child (threadless destroy finalizes to Dead).
+        let dead_child = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let dead_pid = dead_child.pid();
+        assert!(mgr.destroy_process(dead_pid).is_some());
+        assert_eq!(dead_child.state(), ProcessState::Dead);
+
+        let mut reject2 =
+            crate::thread::Builder::new(crate::thread::Entry::C(never_run_entry)).build();
+        assert!(!dead_child.add_thread(reject2.clone()));
+        assert!(reject2.process().is_none());
+        assert!(crate::thread::GlobalQueueVisitor::remove(&mut reject2));
+
+        assert!(root.has_no_children());
+    }
+
+    #[test]
+    fn process_remove_thread_semantics() {
+        let mgr = ProcessManager::get();
+        let root = mgr.root_process().clone();
+        assert!(root.has_no_children());
+
+        let child = mgr
+            .create_process(Arc::downgrade(&root))
+            .expect("create_process failed");
+        let child_pid = child.pid();
+
+        // --- False path: thread not linked to this process ----------------
+        // Build a thread but never `add_thread` it. Its `process_node` is not
+        // linked to any process list, so `ThreadList::detach` returns `false`
+        // and `remove_thread` propagates that without touching `set_process`.
+        let mut unlinked =
+            crate::thread::Builder::new(crate::thread::Entry::C(never_run_entry)).build();
+        assert!(unlinked.process().is_none());
+        assert!(!child.remove_thread(&mut unlinked));
+        // Still no owner, and the child's thread list is still empty.
+        assert!(unlinked.process().is_none());
+        assert!(child.has_no_threads());
+        // Detach from the global queue so the unlinked thread doesn't leak.
+        assert!(crate::thread::GlobalQueueVisitor::remove(&mut unlinked));
+
+        // --- Success path: linked then removed ----------------------------
+        // A barrier-gated worker so we control when it retires. `add_thread`
+        // links it and sets `process` to the child's `Weak`; `remove_thread`
+        // detaches and clears the `Weak` back to empty.
+        let release = Arc::new(crate::sync::ConstBarrier::<{ 2 }>::new());
+        let release_w = release.clone();
+        let worker = crate::thread::spawn(move || {
+            release_w.wait();
+            crate::scheduler::retire_me();
+        })
+        .expect("spawn worker failed");
+        assert!(child.add_thread(worker.clone()));
+        assert!(!child.has_no_threads());
+        assert_eq!(worker.process().map(|p| p.pid()), Some(child_pid));
+
+        // Remove the worker from the child's list *before* it retires. After a
+        // successful remove, the worker's `process()` is `None` again.
+        let mut worker_mut = worker.clone();
+        assert!(child.remove_thread(&mut worker_mut));
+        assert!(worker.process().is_none());
+        assert!(child.has_no_threads());
+
+        // Reap the child ourselves. We just cleared the worker's `process`
+        // `Weak`, so when the worker retires its retire path will see
+        // `old.process() == None` and *not* call `destroy_process` for the
+        // child — left to its own, the child would leak as a threadless
+        // `Alive` process. Destroying it now (threadless => straight to Dead)
+        // reclaims it deterministically. The worker, still scheduled, later
+        // retires harmlessly: its `process()` is `None`, so it touches no
+        // process; `take_cleanup` (None for a `spawn` closure) reaps it.
+        assert!(mgr.destroy_process(child_pid).is_some());
+        assert_eq!(child.state(), ProcessState::Dead);
+        assert!(root.child(child_pid).is_none());
+
+        // Release the barrier so the detached worker actually runs and
+        // retires. The worker's `process()` is `None`, so its retire path
+        // touches no process; it just transitions to `RETIRED` and the
+        // scheduler reaps the worker Arc itself once it switches out. Poll for
+        // the `RETIRED` state so a hang (e.g. worker never scheduled) becomes a
+        // loud failure rather than a silent leak into the next test.
+        release.wait();
+        let mut spins = 0u32;
+        while worker.state() != crate::thread::RETIRED {
+            crate::scheduler::yield_me();
+            spins += 1;
+            assert!(spins < 100_000, "detached worker never retired");
         }
         assert!(root.has_no_children());
     }
